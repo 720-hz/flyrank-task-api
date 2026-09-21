@@ -1,5 +1,8 @@
+from typing import Optional
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 app = FastAPI(
     title="Task API",
@@ -49,22 +52,25 @@ def get_task(task_id: int):
         if task["id"] == task_id:
             return task
     raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-from fastapi import FastAPI
-
-app = FastAPI(
-    title="Task API",
-    version="1.0",
-    description="A small in-memory CRUD API for managing a to-do list.",
-)
 
 
-@app.get("/")
-def root():
-    """Describes this API: its name, version, and top-level endpoints."""
-    return {"name": "Task API", "version": "1.0", "endpoints": ["/tasks"]}
+class TaskCreate(BaseModel):
+    # title is intentionally Optional here, not required, so a body like {}
+    # reaches our own validation below and gets a clean 400 — instead of
+    # Pydantic auto-rejecting it with a 422 the spec never asked for.
+    title: Optional[str] = None
 
 
-@app.get("/health")
-def health():
-    """Liveness check — used to confirm the server is up and responding."""
-    return {"status": "ok"}
+def next_id() -> int:
+    """The next free id — one higher than whatever is currently the largest."""
+    return max((t["id"] for t in tasks), default=0) + 1
+
+
+@app.post("/tasks", status_code=201)
+def create_task(body: TaskCreate):
+    """Creates a task from {"title": "..."}. Rejects a missing/empty title with 400."""
+    if not body.title or not body.title.strip():
+        raise HTTPException(status_code=400, detail="title is required and cannot be empty")
+    task = {"id": next_id(), "title": body.title.strip(), "done": False}
+    tasks.append(task)
+    return task
