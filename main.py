@@ -74,3 +74,38 @@ def create_task(body: TaskCreate):
     task = {"id": next_id(), "title": body.title.strip(), "done": False}
     tasks.append(task)
     return task
+
+
+class TaskUpdate(BaseModel):
+    # Both optional: PUT here means "replace title and/or done with what's
+    # given," not "you must resend every field." title, if given at all,
+    # still has to pass the same non-empty rule as create.
+    title: Optional[str] = None
+    done: Optional[bool] = None
+
+
+@app.put("/tasks/{task_id}")
+def update_task(task_id: int, body: TaskUpdate):
+    """Replaces a task's title and/or done. 404 if unknown id, 400 if the body is invalid."""
+    for task in tasks:
+        if task["id"] == task_id:
+            if body.title is not None and not body.title.strip():
+                raise HTTPException(status_code=400, detail="title cannot be empty")
+            if body.title is None and body.done is None:
+                raise HTTPException(status_code=400, detail="provide title and/or done to update")
+            if body.title is not None:
+                task["title"] = body.title.strip()
+            if body.done is not None:
+                task["done"] = body.done
+            return task
+    raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+
+@app.delete("/tasks/{task_id}", status_code=204)
+def delete_task(task_id: int):
+    """Removes a task. 204 with no body on success, 404 if unknown id."""
+    for i, task in enumerate(tasks):
+        if task["id"] == task_id:
+            tasks.pop(i)
+            return
+    raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
