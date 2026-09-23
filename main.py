@@ -72,9 +72,8 @@ def row_to_task(row: sqlite3.Row) -> dict:
     return {"id": row["id"], "title": row["title"], "done": bool(row["done"])}
 
 
-# create/update/delete haven't moved to SQL yet (next two stages), so this
-# in-memory list stays around until they do — only the two GET endpoints
-# below read from the database now.
+# update/delete haven't moved to SQL yet (next stage), so this in-memory
+# list stays around until they do.
 tasks = [
     {"id": 1, "title": "Buy milk", "done": False},
     {"id": 2, "title": "Write README", "done": False},
@@ -119,19 +118,21 @@ class TaskCreate(BaseModel):
     title: Optional[str] = None
 
 
-def next_id() -> int:
-    """The next free id — one higher than whatever is currently the largest."""
-    return max((t["id"] for t in tasks), default=0) + 1
-
-
 @app.post("/tasks", status_code=201)
 def create_task(body: TaskCreate):
-    """Creates a task from {"title": "..."}. Rejects a missing/empty title with 400."""
+    """Creates a task from {"title": "..."}. Rejects a missing/empty title
+    with 400. The id is assigned by SQLite, not counted from a list."""
     if not body.title or not body.title.strip():
         raise HTTPException(status_code=400, detail="title is required and cannot be empty")
-    task = {"id": next_id(), "title": body.title.strip(), "done": False}
-    tasks.append(task)
-    return task
+    title = body.title.strip()
+    with get_db() as conn:
+        cursor = conn.execute(
+            "INSERT INTO tasks (title, done) VALUES (?, ?)", (title, 0)
+        )
+        new_row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+    return row_to_task(new_row)
 
 
 class TaskUpdate(BaseModel):
