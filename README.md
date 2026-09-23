@@ -82,13 +82,16 @@ Run the server and open `/docs` to see the live, interactive Swagger UI for ever
 ## Project layout
 
 ```
-main.py             the whole API — one file, on purpose, for something this size
-requirements.txt    pinned dependency versions
-tasks.db             SQLite database file — gitignored, created automatically on first run
-.gitignore           Python/venv noise plus *.db and server*.log kept out of the repo
-docs/                 screenshot(s) used in this README
-ai-version/           Stage 7 (W2) — an AI-generated build of the in-memory API, kept
-                      separate from the hand-built submission (see "AI vs me: the CRUD build")
+main.py                the whole API — one file, on purpose, for something this size
+requirements.txt       pinned dependency versions
+tasks.db                SQLite database file — gitignored, created automatically on first run
+.gitignore              Python/venv noise plus *.db and server*.log kept out of the repo
+docs/                    screenshot(s) used in this README
+ai-version/              Stage 7 (W2) — an AI-generated build of the in-memory API, kept
+                         separate from the hand-built submission (see "AI vs me: the CRUD build")
+ai-version/db-migration/ Stage 6 (W3) — an AI-generated migration to SQLite, kept separate
+                         from the hand-built migration in main.py (see "AI vs me: the database
+                         migration")
 ```
 
 ## AI vs me: the CRUD build
@@ -152,6 +155,59 @@ Second prompt, same structure, but with the four gaps above closed explicitly �
 
 Regenerated as [`ai-version/main.py`](ai-version/main.py) and re-ran every checkpoint that failed the first time: missing-title now returns a clean `400`, whitespace-only titles are rejected, an empty `PUT` body returns `400`, and the delete-then-create sequence that previously produced a duplicate `id: 5` now increments cleanly with no collisions — one prompt revision fixed all four issues found in the first pass.
 
+## AI vs me: the database migration
+
+Stage 6 of Assignment 2 (the bonus): same exercise, this time for the in-memory → SQLite migration specifically. I wrote a fresh prompt from memory, handed it the fixed-up in-memory `main.py` from the rematch above, generated a migration, ran it, and compared it against the hand-built `main.py` at the root of this repo.
+
+### The prompt (first attempt)
+
+```
+Take this existing FastAPI to-do list API, currently storing tasks in a
+Python list in memory, and change it to store tasks in a SQLite database
+file called tasks.db instead. Use Python's built-in sqlite3 module.
+
+Requirements:
+- On startup, create a `tasks` table if it doesn't already exist, with
+  columns `id`, `title`, `done`.
+- Seed three example tasks the first time the database is created, but
+  don't re-add them on every restart.
+- Every endpoint (GET /, GET /health, GET /tasks, GET /tasks/{id},
+  POST /tasks, PUT /tasks/{id}, DELETE /tasks/{id}) should keep exactly
+  the same request/response shape and status codes as before — only the
+  storage layer changes.
+- Use parameterized queries, not string formatting, for anything built
+  from user input.
+- Errors should still come back as {"error": "..."} with the same status
+  codes as the in-memory version: 400 for a missing/empty title, 404 for
+  an unknown id.
+
+Here is the existing main.py: [pasted ai-version/main.py from Stage 7]
+
+Give me the whole updated main.py.
+```
+
+Full text in [`ai-version/db-migration/PROMPT_v1.md`](ai-version/db-migration/PROMPT_v1.md); generated code in [`ai-version/db-migration/main_v1.py`](ai-version/db-migration/main_v1.py). I ran it on port 8001 and hit it with real `curl` requests, and separately exercised its exact schema/serialization choices in isolated Python scripts where the live server couldn't get far enough to show them.
+
+### What it got wrong
+
+- **Every endpoint that touched the database crashed with a `500`.** It created one `sqlite3` connection at import time and reused it for every request. FastAPI runs synchronous endpoint functions in a worker thread pool, not the main thread, and `sqlite3` connections refuse to be used outside the thread that created them: `SQLite objects created in a thread can only be used in that same thread`. `GET /` and `GET /health` (no database access) worked fine, which made this worse, not better — a quick smoke test would look healthy right up until the first real request to `/tasks`. I confirmed this live: five back-to-back `GET /tasks` calls, five `500`s.
+- **Task ids can be reused.** It declared the primary key as plain `id INTEGER PRIMARY KEY`, not `AUTOINCREMENT`. I emptied the table completely (mirroring Stage 4's own `DELETE FROM tasks WHERE done = 1` after marking everything done) and created a new task — SQLite handed it back `id: 1`, the same id the very first seed task had. A client that cached `id: 1` from the original seed data would now be looking at a completely different task.
+- **`done` came back as `0`/`1`, not `true`/`false`.** SQLite has no native boolean column type; it stores `done` as an integer either way. The in-memory version always serialized real Python `bool`s. Without an explicit cast, `dict(row)` passed the raw SQLite integer straight into the JSON response — a client checking `if (task.done)` in JavaScript still works by accident, but `task.done === true` silently breaks.
+- **The whitespace-only-title gap from the first AI vs me round came back, worse.** My prompt only said "missing or empty," so `"   "` still isn't caught by `if not body.title`. In the in-memory version this produced a wrong-but-visible `201` with a blank task. Here, the bad title cleared validation and then hit the same broken database connection as everything else — so instead of a data-quality bug, it's now an availability bug: a `500` instead of a silently-created task.
+
+### What my prompt forgot to specify
+
+- That FastAPI's threadpool execution model means a single reused SQL connection isn't just inefficient, it's actively broken — I assumed "use sqlite3" was enough context; it isn't, unless you also know FastAPI won't run your `def` endpoint on the thread that created the connection.
+- That "id" needs the same non-reuse guarantee across a full table wipe, not just across ordinary deletes — I only said "keep the same behavior," which doesn't obviously extend to "never had this failure mode before, in-memory ids were `max()+1` computed fresh every time."
+- That SQLite's lack of a real boolean type needs an explicit cast on the way out — I said "keep exactly the same response shape" but didn't spell out *why* that's not automatic once the backing store is SQLite instead of Python objects.
+- I repeated the same whitespace gap from the first prompt instead of learning from it — carrying a closed gap forward into a new prompt is its own mistake, not just the AI's.
+
+### The rematch
+
+Second prompt — see [`ai-version/db-migration/PROMPT_v2.md`](ai-version/db-migration/PROMPT_v2.md) — added four explicit requirements: open a new connection per request instead of one shared global connection (with the exact exception message named, so the "why" isn't lost); use `INTEGER PRIMARY KEY AUTOINCREMENT`, not bare `INTEGER PRIMARY KEY`; cast `done` to `bool` before returning it; and trim titles before the empty check, so whitespace-only is rejected too.
+
+Regenerated as [`ai-version/db-migration/main.py`](ai-version/db-migration/main.py) and re-verified all four: five consecutive `GET /tasks` calls now all return `200`, `done` serializes as `true`/`false`, a whitespace-only title returns a clean `400` instead of a `500`, and deleting every row and creating a new task now returns `id: 4` — continuing on, never reusing `id: 1`.
+
 ## Development history
 
 This repo's commit history is deliberately staged, one checkpoint at a time, mirroring how the API was actually built:
@@ -164,7 +220,7 @@ This repo's commit history is deliberately staged, one checkpoint at a time, mir
 4. **Stage 3** — `POST /tasks` with hand-written validation instead of relying on Pydantic's automatic rejection, so a bad request comes back as the spec's `400 {"error": ...}` rather than FastAPI's default `422`.
 5. **Stage 4** — `PUT /tasks/{id}` and `DELETE /tasks/{id}`, completing full CRUD.
 6. **Stage 5/6** — Swagger verification and this README.
-7. **Stage 7 (bonus)** — an AI-generated rematch of the same API, kept in `ai-version/` and compared against the hand-built version above; see "AI vs me: the CRUD build."
+7. **Stage 7 (bonus)** — an AI-generated rematch of the same API, kept in `ai-version/` and compared against the hand-built version above; see "AI vs me: the CRUD build."  
 
 **Assignment 2 — connecting the CRUD to SQLite**
 
@@ -172,6 +228,7 @@ This repo's commit history is deliberately staged, one checkpoint at a time, mir
 9. **Stage 1** — `GET /tasks` and `GET /tasks/{id}` reading from SQLite via parameterized queries.
 10. **Stage 2** — `POST /tasks` inserting a row; verified data survives a server restart for the first time.
 11. **Stage 3** — `PUT /tasks/{id}` and `DELETE /tasks/{id}` reimplemented in SQL.
-12. **Extras** — `?search=`, `?done=`, `?sort=title`, `GET /stats`, `created_at`/`updated_at` timestamps, an index on `title`, and transactional seeding.
-13. **Stage 4** — manually ran the five required SQL queries against the live database and confirmed the API reflected each change with no restart; documented in "Database" above.
-14. **Stage 5** — this README's database documentation.
+12. **Stage 4** — manually ran the five required SQL queries against the live database and confirmed the API reflected each change with no restart; documented in "Database" above.
+13. **Stage 5** — this README's database documentation.
+14. **Extras** — `?search=`, `?done=`, `?sort=title`, `GET /stats`, `created_at`/`updated_at` timestamps, an index on `title`, and transactional seeding.
+15. **Stage 6 (bonus)** — an AI-generated rematch of the SQLite migration, kept in `ai-version/db-migration/` and compared against the hand-built migration above; see "AI vs me: the database migration."
