@@ -6,6 +6,7 @@ Target: https://books.toscrape.com (see ../README.md for the target
 classification and robots.txt result).
 """
 
+import datetime
 import os
 import time
 from urllib.parse import urljoin
@@ -77,11 +78,13 @@ def discover_catalogue_pages():
     never a hardcoded page-2.html/page-3.html guess — and stop once
     MAX_CATALOGUE_PAGES have been visited (this assignment's scope is the
     first 3 pages, not the site's real ~50). Returns
-    (list_of_catalogue_page_urls, list_of_unique_absolute_book_urls).
+    (list_of_catalogue_page_urls, list_of_unique_absolute_book_urls,
+    dict_of_book_url_to_its_source_catalogue_page).
     """
     page_urls = []
     book_urls = []
     seen_books = set()
+    source_page_by_book_url = {}
 
     page_url = BASE_URL
     page_number = 1
@@ -103,20 +106,94 @@ def discover_catalogue_pages():
             if absolute_url not in seen_books:
                 seen_books.add(absolute_url)
                 book_urls.append(absolute_url)
+                source_page_by_book_url[absolute_url] = page_url
 
         next_link = soup.select_one("li.next a")
         page_url = urljoin(page_url, next_link["href"]) if next_link else None
         page_number += 1
 
-    return page_urls, book_urls
+    return page_urls, book_urls, source_page_by_book_url
+
+
+def detail_cache_name(book_url: str) -> str:
+    # https://books.toscrape.com/catalogue/<slug>/index.html -> detail-<slug>.html
+    slug = book_url.rstrip("/").split("/")[-2]
+    return f"detail-{slug}.html"
+
+
+def fetched_at_for(cache_name: str) -> str:
+    """
+    Provenance timestamp: when this page's cached copy was actually written
+    to disk, as UTC ISO-8601. That is the real fetch time for this record —
+    not "now," which would drift every time the pipeline re-runs from cache.
+    """
+    path = cache_path_for(cache_name)
+    mtime = os.path.getmtime(path)
+    return (
+        datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+
+
+def extract_record(book_url: str, source_page: str) -> dict:
+    """
+    Pull the 8 raw fields from one book's detail page. Selectors are aimed
+    at the product area (article.product_page / div.product_main), not "the
+    first thing on the page that looks like a price" — a page that later
+    grows a second price elsewhere shouldn't silently break this.
+    """
+    cache_name = detail_cache_name(book_url)
+    html = fetch_page(book_url, cache_name)
+    soup = BeautifulSoup(html, "html.parser")
+
+    product = soup.select_one("article.product_page")
+
+    title = product.select_one(".product_main h1").get_text(strip=True)
+    price_text = product.select_one(".product_main .price_color").get_text(strip=True)
+    availability_text = product.select_one(
+        ".product_main .availability"
+    ).get_text(strip=True)
+
+    rating_tag = product.select_one(".product_main .star-rating")
+    rating_classes = rating_tag.get("class", []) if rating_tag else []
+    # classes are ["star-rating", "<Rating>"] — the rating word is whichever
+    # class isn't the literal "star-rating" marker.
+    rating_text = next((c for c in rating_classes if c != "star-rating"), None)
+
+    description_header = product.select_one("#product_description")
+    description_tag = (
+        description_header.find_next_sibling("p") if description_header else None
+    )
+    # Some books genuinely have no description section at all — store null,
+    # never invent text that was never on the page.
+    description = description_tag.get_text(strip=True) if description_tag else None
+
+    return {
+        "title": title,
+        "product_url": book_url,
+        "price_text": price_text,
+        "availability_text": availability_text,
+        "rating_text": rating_text,
+        "description": description,
+        "source_page": source_page,
+        "fetched_at": fetched_at_for(cache_name),
+    }
 
 
 def main():
-    catalogue_pages, book_urls = discover_catalogue_pages()
+    catalogue_pages, book_urls, source_page_by_book_url = discover_catalogue_pages()
     print(
         f"catalogue_pages={len(catalogue_pages)} "
         f"discovered={len(book_urls)} unique_urls={len(set(book_urls))}"
     )
+
+    raw_records = []
+    for book_url in book_urls:
+        record = extract_record(book_url, source_page_by_book_url[book_url])
+        raw_records.append(record)
+
+    print(raw_records[0])
+    print(f"detail_pages={len(raw_records)}")
 
 
 if __name__ == "__main__":
