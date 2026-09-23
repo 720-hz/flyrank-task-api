@@ -1,14 +1,68 @@
+import sqlite3
+from contextlib import contextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+# A single file on disk instead of a variable in memory. Created
+# automatically the first time a connection touches it — no server,
+# no install, nothing to run in the background.
+DB_PATH = "tasks.db"
+
 app = FastAPI(
     title="Task API",
     version="1.0",
-    description="A small in-memory CRUD API for managing a to-do list.",
+    description="A small CRUD API for managing a to-do list, backed by SQLite.",
 )
+
+
+@contextmanager
+def get_db():
+    """One connection per request. Commits on a clean exit, rolls back
+    (by simply not committing, then closing) if anything inside raises —
+    so a request either fully lands in the database or leaves no trace."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    """Creates the table if missing, then seeds three example tasks —
+    but only the very first time, when the table is still empty. Runs
+    once at startup, not per-request."""
+    with get_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                done BOOLEAN NOT NULL DEFAULT 0
+            )
+            """
+        )
+        # AUTOINCREMENT (not just "INTEGER PRIMARY KEY") matters here: it
+        # guarantees ids are never reused, even after a delete empties the
+        # table. The W2 "AI vs me" review found a real bug where a naive
+        # id = len(list) + 1 scheme collided after a delete-then-create —
+        # this is the SQL-side fix for exactly that class of mistake.
+
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        if count == 0:
+            conn.executemany(
+                "INSERT INTO tasks (title, done) VALUES (?, ?)",
+                [("Buy milk", 0), ("Write README", 0), ("Push to GitHub", 1)],
+            )
+
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
 
 
 # FastAPI's default error body is {"detail": "..."}. The assignment spec
@@ -18,8 +72,10 @@ app = FastAPI(
 def error_shape_handler(request: Request, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
 
-# In-memory "database" — a plain list of dicts. Gone on restart, on purpose:
-# that's next week's lesson (persistence), not a bug in this one.
+# In-memory "database" from Assignment 1 — still what every endpoint below
+# reads and writes. init_db() above only creates and seeds tasks.db; wiring
+# the endpoints themselves over to SQL happens one at a time in the next
+# few stages, so each step has its own clean checkpoint.
 tasks = [
     {"id": 1, "title": "Buy milk", "done": False},
     {"id": 2, "title": "Write README", "done": False},
