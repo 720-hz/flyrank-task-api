@@ -72,15 +72,6 @@ def row_to_task(row: sqlite3.Row) -> dict:
     return {"id": row["id"], "title": row["title"], "done": bool(row["done"])}
 
 
-# update/delete haven't moved to SQL yet (next stage), so this in-memory
-# list stays around until they do.
-tasks = [
-    {"id": 1, "title": "Buy milk", "done": False},
-    {"id": 2, "title": "Write README", "done": False},
-    {"id": 3, "title": "Push to GitHub", "done": True},
-]
-
-
 @app.get("/")
 def root():
     """Describes this API: its name, version, and top-level endpoints."""
@@ -145,26 +136,37 @@ class TaskUpdate(BaseModel):
 
 @app.put("/tasks/{task_id}")
 def update_task(task_id: int, body: TaskUpdate):
-    """Replaces a task's title and/or done. 404 if unknown id, 400 if the body is invalid."""
-    for task in tasks:
-        if task["id"] == task_id:
-            if body.title is not None and not body.title.strip():
+    """Updates a task's title and/or done. 404 if unknown id, 400 if the
+    body is empty or the title is invalid."""
+    if body.title is None and body.done is None:
+        raise HTTPException(status_code=400, detail="provide title and/or done to update")
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+        new_title = row["title"]
+        if body.title is not None:
+            if not body.title.strip():
                 raise HTTPException(status_code=400, detail="title cannot be empty")
-            if body.title is None and body.done is None:
-                raise HTTPException(status_code=400, detail="provide title and/or done to update")
-            if body.title is not None:
-                task["title"] = body.title.strip()
-            if body.done is not None:
-                task["done"] = body.done
-            return task
-    raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+            new_title = body.title.strip()
+
+        new_done = row["done"] if body.done is None else (1 if body.done else 0)
+
+        conn.execute(
+            "UPDATE tasks SET title = ?, done = ? WHERE id = ?",
+            (new_title, new_done, task_id),
+        )
+        updated = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return row_to_task(updated)
 
 
 @app.delete("/tasks/{task_id}", status_code=204)
 def delete_task(task_id: int):
     """Removes a task. 204 with no body on success, 404 if unknown id."""
-    for i, task in enumerate(tasks):
-        if task["id"] == task_id:
-            tasks.pop(i)
-            return
-    raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
