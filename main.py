@@ -46,12 +46,6 @@ def init_db():
             )
             """
         )
-        # AUTOINCREMENT (not just "INTEGER PRIMARY KEY") matters here: it
-        # guarantees ids are never reused, even after a delete empties the
-        # table. The W2 "AI vs me" review found a real bug where a naive
-        # id = len(list) + 1 scheme collided after a delete-then-create —
-        # this is the SQL-side fix for exactly that class of mistake.
-
         count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         if count == 0:
             conn.executemany(
@@ -72,10 +66,15 @@ def on_startup():
 def error_shape_handler(request: Request, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
 
-# In-memory "database" from Assignment 1 — still what every endpoint below
-# reads and writes. init_db() above only creates and seeds tasks.db; wiring
-# the endpoints themselves over to SQL happens one at a time in the next
-# few stages, so each step has its own clean checkpoint.
+
+def row_to_task(row: sqlite3.Row) -> dict:
+    """SQLite stores done as 0/1; the API contract says true/false."""
+    return {"id": row["id"], "title": row["title"], "done": bool(row["done"])}
+
+
+# create/update/delete haven't moved to SQL yet (next two stages), so this
+# in-memory list stays around until they do — only the two GET endpoints
+# below read from the database now.
 tasks = [
     {"id": 1, "title": "Buy milk", "done": False},
     {"id": 2, "title": "Write README", "done": False},
@@ -97,17 +96,20 @@ def health():
 
 @app.get("/tasks")
 def list_tasks():
-    """Returns every task currently in memory."""
-    return tasks
+    """Returns every task, read straight from the database."""
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM tasks").fetchall()
+    return [row_to_task(row) for row in rows]
 
 
 @app.get("/tasks/{task_id}")
 def get_task(task_id: int):
     """Returns a single task by id, or 404 if no task has that id."""
-    for task in tasks:
-        if task["id"] == task_id:
-            return task
-    raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    return row_to_task(row)
 
 
 class TaskCreate(BaseModel):
