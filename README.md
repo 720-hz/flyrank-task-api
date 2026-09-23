@@ -1,8 +1,8 @@
 # Task API
 
-A small in-memory CRUD API for managing a to-do list, built with **FastAPI**. This is Week 2 · Assignment 1 ("Build your first CRUD API") of the FlyRank AI Internship, backend track.
+A small CRUD API for managing a to-do list, built with **FastAPI** and backed by **SQLite**. This started as Week 2 · Assignment 1 ("Build your first CRUD API") of the FlyRank AI Internship, backend track, and continues with Week 3 · Assignment 1 ("Connecting your CRUD to the database").
 
-Tasks live in a plain Python list in memory — there is no database. That's intentional for this assignment: the point is REST semantics (methods, status codes, request/response shapes), not persistence. The API starts with three seed tasks and resets to them every time the server restarts.
+Tasks used to live in a plain Python list in memory — every restart wiped them. They now live in a single file, `tasks.db`, managed with Python's built-in `sqlite3` module. The point of this stage isn't a new feature: the URLs, request bodies, status codes, and response shapes are all identical to Assignment 1. Only what's *behind* the API changed — persistence turned out to be an implementation detail, not a change to the contract clients rely on.
 
 ## Install and run
 
@@ -10,21 +10,22 @@ Tasks live in a plain Python list in memory — there is no database. That's int
 pip install -r requirements.txt && uvicorn main:app --reload
 ```
 
-The server comes up on `http://127.0.0.1:8000`. Interactive Swagger docs are at `http://127.0.0.1:8000/docs` — every endpoint below can be exercised there with "Try it out," no `curl` required.
+The server comes up on `http://127.0.0.1:8000`. `tasks.db` is created automatically, next to `main.py`, the first time the app starts — there's nothing to install or configure, and nothing to run in the background. Interactive Swagger docs are at `http://127.0.0.1:8000/docs` — every endpoint below can be exercised there with "Try it out," no `curl` required.
 
 ## Endpoints
 
-| Method | Path            | Description                                      | Success        | Errors                          |
-|--------|-----------------|---------------------------------------------------|-----------------|----------------------------------|
-| GET    | `/`             | API name, version, and top-level endpoints        | 200             | —                                |
-| GET    | `/health`       | Liveness check                                     | 200             | —                                |
-| GET    | `/tasks`        | List every task                                    | 200             | —                                |
-| POST   | `/tasks`        | Create a task from `{"title": "..."}`              | 201             | 400 missing/empty title          |
-| GET    | `/tasks/{id}`   | Get one task by id                                 | 200             | 404 unknown id                   |
-| PUT    | `/tasks/{id}`   | Update a task's `title` and/or `done`              | 200             | 404 unknown id, 400 invalid body |
-| DELETE | `/tasks/{id}`   | Delete a task                                      | 204             | 404 unknown id                   |
+| Method | Path            | Description                                                        | Success | Errors                          |
+|--------|-----------------|---------------------------------------------------------------------|---------|----------------------------------|
+| GET    | `/`             | API name, version, and top-level endpoints                          | 200     | —                                |
+| GET    | `/health`       | Liveness check                                                       | 200     | —                                |
+| GET    | `/tasks`        | List tasks, optionally filtered/sorted (`?search=`, `?done=`, `?sort=title`) | 200     | —                                |
+| GET    | `/stats`        | Task counts: `{"total", "done", "open"}`                             | 200     | —                                |
+| POST   | `/tasks`        | Create a task from `{"title": "..."}`                                | 201     | 400 missing/empty title          |
+| GET    | `/tasks/{id}`   | Get one task by id                                                    | 200     | 404 unknown id                   |
+| PUT    | `/tasks/{id}`   | Update a task's `title` and/or `done`                                 | 200     | 404 unknown id, 400 invalid body |
+| DELETE | `/tasks/{id}`   | Delete a task                                                          | 204     | 404 unknown id                   |
 
-Every error comes back shaped as `{"error": "..."}` — FastAPI's default `{"detail": "..."}` is remapped globally so the shape is consistent across all four error cases above.
+Every error still comes back shaped as `{"error": "..."}` — that remapping didn't change when the storage layer did.
 
 ## Example
 
@@ -40,23 +41,59 @@ content-type: application/json
 {"id":4,"title":"Write the README","done":false}
 ```
 
+## Database
+
+**Why SQLite.** The assignment's own framing is the reason: SQLite needs no separate server process, no install step, and no configuration — it's a single file that Python's standard library already knows how to talk to. For an API this size, reaching for Postgres or MySQL would mean standing up infrastructure to solve a problem SQLite already solves in one line (`sqlite3.connect("tasks.db")`). The same `sqlite3` module choice (over an ORM like SQLModel) keeps the codebase in the same "one file, on purpose" spirit as Assignment 1 — the SQL is written out directly, so what the database is doing is never hidden behind an abstraction layer.
+
+**Where the data lives.** `tasks.db` sits next to `main.py` in the project root. It's gitignored (see [Project layout](#project-layout) below) — every clone creates its own copy the first time the app starts, and `CREATE TABLE IF NOT EXISTS` plus a seed-only-if-empty check mean that's always safe, even across dozens of restarts.
+
+**Run it.** Same command as always: `uvicorn main:app --reload`. The first request or startup event creates the table and seeds three example tasks; every request after that just reads and writes the same file.
+
+**One example query.** Stage 4 asked for manual exploration with a SQLite viewer. This sandbox couldn't install one (no `sqlite3` CLI or GUI browser available — see the note under the image below), so the same required queries were run through Python's `sqlite3` module directly against the live `tasks.db`, and `GET /tasks` was called before and after each one to confirm the API reflected the change immediately, with no restart:
+
+```sql
+UPDATE tasks SET done = 1;
+-- 3 rows affected
+```
+
+![Terminal output of the five required Stage 4 SQL queries run against tasks.db](docs/stage4-sql.png)
+
+*No CLI/GUI SQLite viewer was installable in this environment, so the same five queries DB Browser for SQLite would run (`SELECT * FROM tasks`, `SELECT * FROM tasks WHERE done = 1`, `SELECT COUNT(*) FROM tasks`, `UPDATE tasks SET done = 1`, `DELETE FROM tasks WHERE done = 1`) were run for real through Python's `sqlite3` module against the actual `tasks.db` — this is that real output, not a mockup.*
+
+## Extras implemented
+
+All optional from the assignment's "★ Optional extras" list:
+
+- **`?search=`** — `GET /tasks?search=milk` filters with SQL's `LIKE` and `%...%` wildcarding (contains, not just starts-with).
+- **`?done=`** — `GET /tasks?done=true` filters with a `WHERE done = ?` clause.
+- **`?sort=title`** — orders results alphabetically instead of by insertion order (`id`).
+- **`GET /stats`** — returns `{"total", "done", "open"}` computed with two `SELECT COUNT(*)` queries, not by looping over rows in Python.
+- **Timestamps** — every task carries `created_at` and `updated_at` (`TEXT`, defaulting to `datetime('now')`); `updated_at` is bumped on every `PUT`, verified by updating a task and diffing the two timestamps.
+
+Two more, not on the assignment's list but a natural fit once the schema existed:
+
+- **An index on `title`** (`CREATE INDEX IF NOT EXISTS idx_tasks_title ON tasks(title)`) backs `?search=` and `?sort=title` — without it, both would scan every row; with it, SQLite can look titles up the way a book's index beats reading every page.
+- **Transactional seeding** — the three seed rows share `init_db()`'s single connection and its one `commit()` call (see `get_db()` in `main.py`), so they're inserted as one all-or-nothing transaction. Ending up with zero seed rows is fine; ending up with two out of three, silently, because a hypothetical third insert failed midway, is exactly the kind of half-written state a transaction rules out.
+
 ## Swagger UI
 
-Run the server and open `/docs` to see the live, interactive Swagger UI for all seven endpoints (a static screenshot of it was captured during development as part of this stage's verification).
+Run the server and open `/docs` to see the live, interactive Swagger UI for every endpoint above (a static screenshot of it was captured during development as part of this stage's verification).
 
 ## Project layout
 
 ```
 main.py             the whole API — one file, on purpose, for something this size
 requirements.txt    pinned dependency versions
-.gitignore          Python/venv noise kept out of the repo
-ai-version/          Stage 7 — an AI-generated build of the same API, kept separate
-                     from the hand-built submission above (see "AI vs me" below)
+tasks.db             SQLite database file — gitignored, created automatically on first run
+.gitignore           Python/venv noise plus *.db and server*.log kept out of the repo
+docs/                 screenshot(s) used in this README
+ai-version/           Stage 7 (W2) — an AI-generated build of the in-memory API, kept
+                      separate from the hand-built submission (see "AI vs me: the CRUD build")
 ```
 
-## AI vs me
+## AI vs me: the CRUD build
 
-Stage 7 of the assignment: write a prompt from memory (no copying from the spec), have an AI generate the same API from it, then actually run both and compare. Everything below is real — I ran the AI's code, hit it with the same checkpoint `curl`s used to build Stages 0–4, and reported what actually happened, not what I expected to happen.
+Stage 7 of Assignment 1: write a prompt from memory (no copying from the spec), have an AI generate the same API from it, then actually run both and compare. Everything below is real — I ran the AI's code, hit it with the same checkpoint `curl`s used to build Stages 0–4, and reported what actually happened, not what I expected to happen.
 
 ### The prompt (first attempt)
 
@@ -119,10 +156,22 @@ Regenerated as [`ai-version/main.py`](ai-version/main.py) and re-ran every check
 
 This repo's commit history is deliberately staged, one checkpoint at a time, mirroring how the API was actually built:
 
+**Assignment 1 — the CRUD API (in-memory)**
+
 1. **Stage 0** — a bare "hello world" server, just to prove FastAPI and uvicorn were wired up.
 2. **Stage 1** — `/` and `/health`, the two endpoints with no state behind them.
 3. **Stage 2** — the in-memory task list plus the two read endpoints (`GET /tasks`, `GET /tasks/{id}`), including the 404 case.
 4. **Stage 3** — `POST /tasks` with hand-written validation instead of relying on Pydantic's automatic rejection, so a bad request comes back as the spec's `400 {"error": ...}` rather than FastAPI's default `422`.
 5. **Stage 4** — `PUT /tasks/{id}` and `DELETE /tasks/{id}`, completing full CRUD.
 6. **Stage 5/6** — Swagger verification and this README.
-7. **Stage 7 (bonus)** — an AI-generated rematch of the same API, kept in `ai-version/` and compared against the hand-built version above; see "AI vs me."
+7. **Stage 7 (bonus)** — an AI-generated rematch of the same API, kept in `ai-version/` and compared against the hand-built version above; see "AI vs me: the CRUD build."
+
+**Assignment 2 — connecting the CRUD to SQLite**
+
+8. **Stage 0** — created `tasks.db`, the `tasks` table, and seed-once logic in place of the in-memory list.
+9. **Stage 1** — `GET /tasks` and `GET /tasks/{id}` reading from SQLite via parameterized queries.
+10. **Stage 2** — `POST /tasks` inserting a row; verified data survives a server restart for the first time.
+11. **Stage 3** — `PUT /tasks/{id}` and `DELETE /tasks/{id}` reimplemented in SQL.
+12. **Extras** — `?search=`, `?done=`, `?sort=title`, `GET /stats`, `created_at`/`updated_at` timestamps, an index on `title`, and transactional seeding.
+13. **Stage 4** — manually ran the five required SQL queries against the live database and confirmed the API reflected each change with no restart; documented in "Database" above.
+14. **Stage 5** — this README's database documentation.
