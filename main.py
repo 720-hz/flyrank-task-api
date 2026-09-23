@@ -33,21 +33,42 @@ def get_db():
 
 
 def init_db():
-    """Creates the table if missing, then seeds three example tasks —
-    but only the very first time, when the table is still empty. Runs
-    once at startup, not per-request."""
+    """Creates the table (and its index) if missing, then seeds three
+    example tasks — but only the very first time, when the table is
+    still empty. Runs once at startup, not per-request."""
     with get_db() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
-                done BOOLEAN NOT NULL DEFAULT 0
+                done BOOLEAN NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
             """
         )
+        # AUTOINCREMENT (not just "INTEGER PRIMARY KEY") matters here:
+        # it guarantees ids are never reused, even after a delete. The W2
+        # "AI vs me" review found a real bug where a naive id = len(list)+1
+        # scheme collided after a delete-then-create — this is the SQL-side
+        # fix for exactly that class of mistake.
+
+        # An index backs the ?search= and ?sort=title extras below — without
+        # it, every LIKE/ORDER BY on title would scan the whole table row by
+        # row; with it, SQLite can look titles up the way a book's index
+        # beats reading every page.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_title ON tasks(title)")
+
         count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         if count == 0:
+            # All three seed rows share this one connection's single
+            # commit() (see get_db above), so they're inserted as one
+            # transaction: if the third insert failed partway through, the
+            # first two would roll back with it. Ending up with zero seed
+            # rows is fine; ending up with two out of three, silently, is
+            # the kind of half-written state a transaction exists to rule
+            # out.
             conn.executemany(
                 "INSERT INTO tasks (title, done) VALUES (?, ?)",
                 [("Buy milk", 0), ("Write README", 0), ("Push to GitHub", 1)],
@@ -85,11 +106,39 @@ def health():
 
 
 @app.get("/tasks")
-def list_tasks():
-    """Returns every task, read straight from the database."""
+def list_tasks(
+    search: Optional[str] = None,
+    done: Optional[bool] = None,
+    sort: Optional[str] = None,
+):
+    """Returns every task, filtered in SQL by ?search= / ?done= and ordered
+    by ?sort=title (default: insertion order, i.e. by id). All three are
+    optional extras layered on top of the required GET /tasks."""
+    query = "SELECT * FROM tasks WHERE 1 = 1"
+    params: list = []
+    if search:
+        # % is a wildcard in LIKE; wrapping the term in %...% means
+        # "contains", not "starts with" or an exact match.
+        query += " AND title LIKE ?"
+        params.append(f"%{search}%")
+    if done is not None:
+        query += " AND done = ?"
+        params.append(1 if done else 0)
+    query += " ORDER BY title" if sort == "title" else " ORDER BY id"
+
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM tasks").fetchall()
+        rows = conn.execute(query, params).fetchall()
     return [row_to_task(row) for row in rows]
+
+
+@app.get("/stats")
+def stats():
+    """Task counts computed by SQL's COUNT(), not by looping over rows
+    in Python — the database counts its own rows faster than we could."""
+    with get_db() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        done_count = conn.execute("SELECT COUNT(*) FROM tasks WHERE done = 1").fetchone()[0]
+    return {"total": total, "done": done_count, "open": total - done_count}
 
 
 @app.get("/tasks/{task_id}")
@@ -109,13 +158,23 @@ class TaskCreate(BaseModel):
     title: Optional[str] = None
 
 
+def clean_title(title: Optional[str]) -> Optional[str]:
+    """Trims the title and returns None if it's missing, empty, or
+    whitespace-only — the one check every write endpoint shares."""
+    if title is None:
+        return None
+    trimmed = title.strip()
+    return trimmed if trimmed else None
+
+
 @app.post("/tasks", status_code=201)
 def create_task(body: TaskCreate):
-    """Creates a task from {"title": "..."}. Rejects a missing/empty title
-    with 400. The id is assigned by SQLite, not counted from a list."""
-    if not body.title or not body.title.strip():
+    """Creates a task from {"title": "..."}. Rejects a missing/empty/
+    whitespace-only title with 400. The id is assigned by SQLite, not by
+    counting rows in Python."""
+    title = clean_title(body.title)
+    if title is None:
         raise HTTPException(status_code=400, detail="title is required and cannot be empty")
-    title = body.title.strip()
     with get_db() as conn:
         cursor = conn.execute(
             "INSERT INTO tasks (title, done) VALUES (?, ?)", (title, 0)
@@ -148,14 +207,15 @@ def update_task(task_id: int, body: TaskUpdate):
 
         new_title = row["title"]
         if body.title is not None:
-            if not body.title.strip():
+            cleaned = clean_title(body.title)
+            if cleaned is None:
                 raise HTTPException(status_code=400, detail="title cannot be empty")
-            new_title = body.title.strip()
+            new_title = cleaned
 
         new_done = row["done"] if body.done is None else (1 if body.done else 0)
 
         conn.execute(
-            "UPDATE tasks SET title = ?, done = ? WHERE id = ?",
+            "UPDATE tasks SET title = ?, done = ?, updated_at = datetime('now') WHERE id = ?",
             (new_title, new_done, task_id),
         )
         updated = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
