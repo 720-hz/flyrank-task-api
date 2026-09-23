@@ -7,19 +7,25 @@ classification and robots.txt result).
 """
 
 import datetime
+import json
 import os
+import re
 import time
+from typing import Optional
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field, ValidationError
 
 BASE_URL = "https://books.toscrape.com/"
 
 # The assignment's scope is the first 3 catalogue pages only, out of the
 # site's real ~50 — not "however many pages the site happens to have."
 MAX_CATALOGUE_PAGES = 3
-CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache")
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CACHE_DIR = os.path.join(ROOT_DIR, "cache")
+OUTPUT_DIR = os.path.join(ROOT_DIR, "output")
 
 # An honest user-agent that names the bot and links back to the repo — a site
 # owner who sees it in their logs can find out who's requesting their pages.
@@ -180,6 +186,93 @@ def extract_record(book_url: str, source_page: str) -> dict:
     }
 
 
+PRICE_PATTERN = re.compile(r"£\s*([0-9]+(?:\.[0-9]+)?)")
+
+
+def parse_price_gbp(price_text: str) -> float:
+    """"£51.77" -> 51.77. Raises ValueError on anything that isn't a plain
+    GBP amount — that failure is caught by the caller and turned into an
+    errors.json entry, not a crash."""
+    match = PRICE_PATTERN.search(price_text)
+    if not match:
+        raise ValueError(f"unparseable price_text: {price_text!r}")
+    return float(match.group(1))
+
+
+class BookRecord(BaseModel):
+    """
+    The shape of a finished, storable record. product_url doubles as the
+    record's canonical identity (see store_records). Every field but
+    description is required; description is the one field the source pages
+    are allowed to genuinely not have.
+    """
+
+    title: str = Field(min_length=1)
+    product_url: str = Field(min_length=1)
+    price_text: str = Field(min_length=1)
+    price_gbp: float = Field(gt=0)
+    availability_text: str = Field(min_length=1)
+    rating_text: str = Field(min_length=1)
+    description: Optional[str] = None
+    source_page: str = Field(min_length=1)
+    fetched_at: str = Field(min_length=1)
+
+
+def normalize_and_validate(raw_records: list) -> tuple:
+    """
+    Turn each raw record into its clean, schema-checked form. A record that
+    fails — a bad price, a missing field — goes to the errors list with the
+    reason attached; it never reaches the valid list. Returns
+    (valid_records, error_entries).
+    """
+    valid_records = []
+    error_entries = []
+
+    for raw in raw_records:
+        try:
+            price_gbp = parse_price_gbp(raw["price_text"])
+            candidate = {**raw, "price_gbp": price_gbp}
+            record = BookRecord.model_validate(candidate)
+            valid_records.append(record.model_dump())
+        except (ValueError, ValidationError) as exc:
+            error_entries.append(
+                {
+                    "product_url": raw.get("product_url"),
+                    "reason": str(exc),
+                }
+            )
+
+    return valid_records, error_entries
+
+
+def store_records(valid_records: list) -> list:
+    """
+    Write the good records to output/books.json, keyed by canonical URL so a
+    record appearing twice counts once. This function always writes the full
+    current set (never appends), which is what makes a rerun idempotent —
+    60 records in, 60 records out, never 120.
+    """
+    by_canonical_url = {}
+    for record in valid_records:
+        by_canonical_url[record["product_url"]] = record
+
+    unique_records = list(by_canonical_url.values())
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    books_path = os.path.join(OUTPUT_DIR, "books.json")
+    with open(books_path, "w", encoding="utf-8") as f:
+        json.dump(unique_records, f, indent=2, ensure_ascii=False)
+
+    return unique_records
+
+
+def store_errors(error_entries: list):
+    errors_path = os.path.join(OUTPUT_DIR, "errors.json")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(errors_path, "w", encoding="utf-8") as f:
+        json.dump(error_entries, f, indent=2, ensure_ascii=False)
+
+
 def main():
     catalogue_pages, book_urls, source_page_by_book_url = discover_catalogue_pages()
     print(
@@ -191,9 +284,18 @@ def main():
     for book_url in book_urls:
         record = extract_record(book_url, source_page_by_book_url[book_url])
         raw_records.append(record)
-
-    print(raw_records[0])
     print(f"detail_pages={len(raw_records)}")
+
+    valid_records, error_entries = normalize_and_validate(raw_records)
+    stored_records = store_records(valid_records)
+    store_errors(error_entries)
+
+    all_gbp_numeric = all(isinstance(r["price_gbp"], float) for r in stored_records)
+    all_https = all(r["product_url"].startswith("https://") for r in stored_records)
+    print(
+        f"books.json={len(stored_records)} errors.json={len(error_entries)} "
+        f"all_price_gbp_numeric={all_gbp_numeric} all_urls_https={all_https}"
+    )
 
 
 if __name__ == "__main__":
