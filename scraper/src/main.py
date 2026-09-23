@@ -8,10 +8,16 @@ classification and robots.txt result).
 
 import os
 import time
+from urllib.parse import urljoin
 
 import requests
+from bs4 import BeautifulSoup
 
 BASE_URL = "https://books.toscrape.com/"
+
+# The assignment's scope is the first 3 catalogue pages only, out of the
+# site's real ~50 — not "however many pages the site happens to have."
+MAX_CATALOGUE_PAGES = 3
 CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache")
 
 # An honest user-agent that names the bot and links back to the repo — a site
@@ -65,8 +71,52 @@ def fetch_page(url: str, cache_name: str) -> str:
     return html
 
 
+def discover_catalogue_pages():
+    """
+    Walk the catalogue from page 1, following the site's own "next" link —
+    never a hardcoded page-2.html/page-3.html guess — and stop once
+    MAX_CATALOGUE_PAGES have been visited (this assignment's scope is the
+    first 3 pages, not the site's real ~50). Returns
+    (list_of_catalogue_page_urls, list_of_unique_absolute_book_urls).
+    """
+    page_urls = []
+    book_urls = []
+    seen_books = set()
+
+    page_url = BASE_URL
+    page_number = 1
+
+    while page_url and page_number <= MAX_CATALOGUE_PAGES:
+        cache_name = f"catalogue-page-{page_number}.html"
+        html = fetch_page(page_url, cache_name)
+        page_urls.append(page_url)
+        soup = BeautifulSoup(html, "html.parser")
+
+        # The product area only — each book is an <article class="product_pod">
+        # with its title link inside an <h3>. Aiming here (not "every <a> on
+        # the page") avoids picking up nav/footer links by accident.
+        for article in soup.select("article.product_pod"):
+            link = article.select_one("h3 a")
+            if link is None or not link.get("href"):
+                continue
+            absolute_url = urljoin(page_url, link["href"])
+            if absolute_url not in seen_books:
+                seen_books.add(absolute_url)
+                book_urls.append(absolute_url)
+
+        next_link = soup.select_one("li.next a")
+        page_url = urljoin(page_url, next_link["href"]) if next_link else None
+        page_number += 1
+
+    return page_urls, book_urls
+
+
 def main():
-    fetch_page(BASE_URL, "catalogue-page-1.html")
+    catalogue_pages, book_urls = discover_catalogue_pages()
+    print(
+        f"catalogue_pages={len(catalogue_pages)} "
+        f"discovered={len(book_urls)} unique_urls={len(set(book_urls))}"
+    )
 
 
 if __name__ == "__main__":
