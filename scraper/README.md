@@ -128,6 +128,56 @@ A real run, from cache, all 60 books, zero failures:
 produced this report — that's what the idempotency checkpoint is proving. The
 [first live population run](#one-honest-limitation) is the one described above.
 
+## Bonus — AI vs me
+
+The prompt in [`ai-version/PROMPT_v1.md`](ai-version/PROMPT_v1.md) was written from
+memory — a plain recollection of what this scraper needed to do, not a copy of the
+assignment spec. `ai-version/main_v1.py` was generated from that prompt alone and
+run against the exact same real cached pages the hand-built version used, so the
+comparison is apples to apples.
+
+**What the AI did better:** honestly, not much structurally — the overall shape
+(fetch/cache → discover → extract → validate → save → report) came out close to the
+hand-built version, which says the prompt communicated the pipeline shape fine. The
+one place it's arguably cleaner is that it treats every non-200 the same way in one
+retry loop instead of branching early, which reads simply — right up until that
+simplicity turns out to be the bug.
+
+**What it got wrong** (all three verified live against real data, not just read in
+the diff):
+
+1. **100% failure rate from one bad line.** `rating_tag["class"].split()[-1]` — bs4
+   already hands back a multi-valued attribute like `class` as a **list**, not a
+   string, so `.split()` throws `AttributeError: 'AttributeValueList' object has no
+   attribute 'split'` on every single book. Running `main_v1.py` against the real
+   60 cached pages produced `valid=0 errors=60` — every record failed on the exact
+   same line.
+2. **Retries a `404` twice before giving up.** The prompt said "handle failures
+   gracefully" without naming which statuses are worth retrying, so the AI applied
+   one retry policy to everything. Pointed at a mock 404 endpoint, it printed
+   `retrying ... attempt 1` and `attempt 2` before giving up — two wasted requests
+   to a page that was never going to exist.
+3. **Not idempotent.** `save_books()` reads back whatever's already in
+   `books.json` and appends the new records to it, instead of overwriting. Calling
+   it twice with the same 2 test records left 4 records on disk, not 2 — a rerun of
+   the real scraper would silently double `books.json` every time.
+
+**What my prompt forgot to say** (the more useful half): the exact retry policy per
+status code, the overwrite-not-append requirement for idempotency, and — the one
+that actually caused the crash — that a bs4 multi-valued attribute comes back as a
+list already, not something to re-split. None of these are exotic; they're the kind
+of detail that's obvious once you've hit it and invisible until then, which is
+exactly why writing the prompt from memory (not copying the spec) is the point of
+the exercise — the gaps that show up are gaps in how precisely the problem was
+specified, not just gaps in what the AI happened to do.
+
+**The rematch:** [`ai-version/PROMPT_v2.md`](ai-version/PROMPT_v2.md) names all
+three gaps explicitly. [`ai-version/main.py`](ai-version/main.py), generated from
+that revised prompt, was re-run against the same real cached pages:
+`valid=60 errors=0` on the first run, still `60` records (not `120`) after a
+second run, and a `404` against the mock endpoint now fails immediately with
+`giving up on fake.html (status 404, not retrying)` instead of retrying.
+
 ## Ethics note
 
 Use an official API instead of scraping whenever one exists — it's faster, more
