@@ -6,10 +6,12 @@ Target: https://books.toscrape.com (see ../README.md for the target
 classification and robots.txt result).
 """
 
+import argparse
 import datetime
 import json
 import os
 import re
+import sys
 import time
 from typing import Optional
 from urllib.parse import urljoin
@@ -39,7 +41,17 @@ def cache_path_for(cache_name: str) -> str:
     return os.path.join(CACHE_DIR, cache_name)
 
 
-def fetch_page(url: str, cache_name: str) -> str:
+class FetchError(Exception):
+    """One page's fetch failed for good — after a retry where a retry was
+    warranted. Callers catch this per-page so one bad page never takes the
+    whole run down."""
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
+
+
+def fetch_page(url: str, cache_name: str, stats: Optional[dict] = None, retries_left: int = 1) -> str:
     """
     Fetch a page's HTML, politely, with a cache-first read.
 
@@ -49,7 +61,11 @@ def fetch_page(url: str, cache_name: str) -> str:
       timeout, checks the status code, saves the raw HTML to cache, and
       waits REQUEST_DELAY_SECONDS before returning (so the *next* real
       request — not this one — respects the politeness delay).
-    - Raises for any non-200 status: a failed fetch is not HTML to parse.
+    - A timeout or a 5xx is worth one retry after a short wait — the site
+      may just be briefly overloaded. A 404 or 403 is not retried: the page
+      either doesn't exist or the site said no, and asking again changes
+      nothing except being a worse guest.
+    - Raises FetchError on final failure — never crashes the caller.
     """
     path = cache_path_for(cache_name)
 
@@ -57,28 +73,51 @@ def fetch_page(url: str, cache_name: str) -> str:
         with open(path, "r", encoding="utf-8") as f:
             html = f.read()
         print(f"CACHE HIT {cache_name} ({len(html)} bytes)")
+        if stats is not None:
+            stats["cache_hits"] += 1
         return html
 
     os.makedirs(CACHE_DIR, exist_ok=True)
-    response = requests.get(
-        url,
-        headers={"User-Agent": USER_AGENT},
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
 
-    if response.status_code != 200:
-        raise RuntimeError(f"FETCH FAILED {url} -> status {response.status_code}")
+    try:
+        response = requests.get(
+            url,
+            headers={"User-Agent": USER_AGENT},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+    except requests.exceptions.RequestException as exc:
+        if retries_left > 0:
+            print(f"RETRY {cache_name} after request error: {exc}")
+            time.sleep(REQUEST_DELAY_SECONDS)
+            return fetch_page(url, cache_name, stats=stats, retries_left=retries_left - 1)
+        raise FetchError(f"{cache_name}: request failed after retry: {exc}")
 
-    html = response.text
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
+    if response.status_code == 200:
+        html = response.text
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"FETCH {cache_name} ({len(html)} bytes, status 200)")
+        if stats is not None:
+            stats["pages_fetched"] += 1
+        time.sleep(REQUEST_DELAY_SECONDS)
+        return html
 
-    print(f"FETCH {cache_name} ({len(html)} bytes, status {response.status_code})")
-    time.sleep(REQUEST_DELAY_SECONDS)
-    return html
+    if response.status_code in (404, 403):
+        # Not retryable: the page is genuinely gone, or the site declined —
+        # retrying either one is how a polite robot becomes a pest.
+        print(f"FAIL {cache_name}: status {response.status_code} (not retrying)")
+        raise FetchError(f"{cache_name}: status {response.status_code}", status=response.status_code)
+
+    if response.status_code >= 500 and retries_left > 0:
+        print(f"RETRY {cache_name} after status {response.status_code}")
+        time.sleep(REQUEST_DELAY_SECONDS)
+        return fetch_page(url, cache_name, stats=stats, retries_left=retries_left - 1)
+
+    print(f"FAIL {cache_name}: status {response.status_code}")
+    raise FetchError(f"{cache_name}: status {response.status_code}", status=response.status_code)
 
 
-def discover_catalogue_pages():
+def discover_catalogue_pages(stats: Optional[dict] = None):
     """
     Walk the catalogue from page 1, following the site's own "next" link —
     never a hardcoded page-2.html/page-3.html guess — and stop once
@@ -97,7 +136,7 @@ def discover_catalogue_pages():
 
     while page_url and page_number <= MAX_CATALOGUE_PAGES:
         cache_name = f"catalogue-page-{page_number}.html"
-        html = fetch_page(page_url, cache_name)
+        html = fetch_page(page_url, cache_name, stats=stats)
         page_urls.append(page_url)
         soup = BeautifulSoup(html, "html.parser")
 
@@ -141,15 +180,19 @@ def fetched_at_for(cache_name: str) -> str:
     )
 
 
-def extract_record(book_url: str, source_page: str) -> dict:
+def extract_record(book_url: str, source_page: str, stats: Optional[dict] = None) -> dict:
     """
     Pull the 8 raw fields from one book's detail page. Selectors are aimed
     at the product area (article.product_page / div.product_main), not "the
     first thing on the page that looks like a price" — a page that later
     grows a second price elsewhere shouldn't silently break this.
+
+    Raises FetchError (propagated from fetch_page) if the page can't be
+    fetched at all — the caller is responsible for catching that per-book,
+    so one broken page doesn't take the other 59 down with it.
     """
     cache_name = detail_cache_name(book_url)
-    html = fetch_page(book_url, cache_name)
+    html = fetch_page(book_url, cache_name, stats=stats)
     soup = BeautifulSoup(html, "html.parser")
 
     product = soup.select_one("article.product_page")
@@ -273,18 +316,46 @@ def store_errors(error_entries: list):
         json.dump(error_entries, f, indent=2, ensure_ascii=False)
 
 
-def main():
-    catalogue_pages, book_urls, source_page_by_book_url = discover_catalogue_pages()
+def store_run_report(report: dict):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    report_path = os.path.join(OUTPUT_DIR, "run-report.json")
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+
+
+def run(extra_book_urls: Optional[list] = None) -> dict:
+    """
+    Run the full pipeline once: fetch -> extract -> normalize -> validate ->
+    store -> report. extra_book_urls exists only so Stage 5's checkpoint can
+    inject one deliberately-broken URL on purpose (see --inject-fake-url) —
+    the default run never adds anything that wasn't discovered for real.
+    """
+    start = datetime.datetime.now(tz=datetime.timezone.utc)
+    stats = {"pages_fetched": 0, "cache_hits": 0}
+
+    catalogue_pages, book_urls, source_page_by_book_url = discover_catalogue_pages(stats=stats)
     print(
         f"catalogue_pages={len(catalogue_pages)} "
         f"discovered={len(book_urls)} unique_urls={len(set(book_urls))}"
     )
 
+    if extra_book_urls:
+        for fake_url in extra_book_urls:
+            book_urls.append(fake_url)
+            source_page_by_book_url[fake_url] = "manual-test-injection"
+
     raw_records = []
+    failed_pages = []
     for book_url in book_urls:
-        record = extract_record(book_url, source_page_by_book_url[book_url])
-        raw_records.append(record)
-    print(f"detail_pages={len(raw_records)}")
+        try:
+            record = extract_record(book_url, source_page_by_book_url[book_url], stats=stats)
+            raw_records.append(record)
+        except FetchError as exc:
+            # Handled per-page, on purpose: one broken page is logged and
+            # skipped here, not left to crash the other 59.
+            print(f"SKIP {book_url}: {exc}")
+            failed_pages.append({"url": book_url, "reason": str(exc)})
+    print(f"detail_pages={len(raw_records)} failed_pages={len(failed_pages)}")
 
     valid_records, error_entries = normalize_and_validate(raw_records)
     stored_records = store_records(valid_records)
@@ -296,6 +367,44 @@ def main():
         f"books.json={len(stored_records)} errors.json={len(error_entries)} "
         f"all_price_gbp_numeric={all_gbp_numeric} all_urls_https={all_https}"
     )
+
+    finished = datetime.datetime.now(tz=datetime.timezone.utc)
+    report = {
+        "start_time": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "duration_seconds": round((finished - start).total_seconds(), 3),
+        "pages_fetched": stats["pages_fetched"],
+        "cache_hits": stats["cache_hits"],
+        "valid_records": len(stored_records),
+        "invalid_records": len(error_entries),
+        "failed_pages": len(failed_pages),
+        "failed_page_details": failed_pages,
+    }
+    store_run_report(report)
+    print(
+        f"run_report: pages_fetched={report['pages_fetched']} "
+        f"cache_hits={report['cache_hits']} valid_records={report['valid_records']} "
+        f"invalid_records={report['invalid_records']} failed_pages={report['failed_pages']} "
+        f"duration_seconds={report['duration_seconds']}"
+    )
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(description="The polite scraper (books.toscrape.com)")
+    parser.add_argument(
+        "--inject-fake-url",
+        dest="inject_fake_url",
+        default=None,
+        help=(
+            "Stage 5 proof only: add one made-up book URL to the run on "
+            "purpose, to show a broken page is logged and skipped instead "
+            "of crashing the run."
+        ),
+    )
+    args = parser.parse_args()
+
+    extra = [args.inject_fake_url] if args.inject_fake_url else None
+    run(extra_book_urls=extra)
 
 
 if __name__ == "__main__":
