@@ -1,23 +1,47 @@
 # Task API
 
-A small CRUD API for managing a to-do list, built with **FastAPI** and backed by **SQLite**. This started as Week 2 · Assignment 1 ("Build your first CRUD API") of the FlyRank AI Internship, backend track, and continues with Week 3 · Assignment 1 ("Connecting your CRUD to the database").
+A small CRUD API for managing a to-do list, built with **FastAPI**. It's had three storage engines behind the same unchanged API: a plain Python list in memory (Week 2 · Assignment 1, "Build your first CRUD API"), a single `tasks.db` SQLite file (Week 3 · Assignment 1, "Connecting your CRUD to the database"), and now a real **Postgres** server running in **Docker** (the FlyRank source document labels this one "Backend Track · Week 1 · Assignment A3, Containerize your stack" — the internship's own numbering shifts between documents, this README just keeps building on the same repo in order).
 
-Tasks used to live in a plain Python list in memory — every restart wiped them. They now live in a single file, `tasks.db`, managed with Python's built-in `sqlite3` module. The point of this stage isn't a new feature: the URLs, request bodies, status codes, and response shapes are all identical to Assignment 1. Only what's *behind* the API changed — persistence turned out to be an implementation detail, not a change to the contract clients rely on.
+Each swap changed only what's *behind* the API — the URLs, request bodies, status codes, and response shapes have been identical since Assignment 1. That's the whole point of the exercise: storage is an implementation detail, not a change to the contract clients rely on. This time it's provable in one sentence — every database line the project has ever needed now lives in one file, [`db.py`](db.py), and swapping SQLite for Postgres touched that file and nothing else.
 
 ## Install and run
 
+**With Docker (the one-command way the assignment asks for):**
+
 ```bash
-pip install -r requirements.txt && uvicorn main:app --reload
+cp .env.example .env
+docker compose up
 ```
 
-The server comes up on `http://127.0.0.1:8000`. `tasks.db` is created automatically, next to `main.py`, the first time the app starts — there's nothing to install or configure, and nothing to run in the background. Interactive Swagger docs are at `http://127.0.0.1:8000/docs` — every endpoint below can be exercised there with "Try it out," no `curl` required.
+This builds the API image, starts Postgres in its own container with a named volume (`taskdata`) so its data outlives the container, and brings the app up on `http://127.0.0.1:8000` once the database is reachable. `.env` is read by `db.py` for local (non-Docker) runs; inside `docker-compose.yml` the api container gets `DATABASE_URL` directly from the `environment:` block instead, pointed at the `db` service by name — not `localhost` — because that's how containers on the same compose network address each other.
+
+**Without Docker (plain Postgres, e.g. for local development):**
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env   # then point DATABASE_URL at your own Postgres
+uvicorn main:app --reload
+```
+
+Either way, the very first request or startup event creates the `tasks` table and seeds three example tasks — nothing to configure by hand. Interactive Swagger docs are at `http://127.0.0.1:8000/docs` — every endpoint below can be exercised there with "Try it out," no `curl` required.
+
+## Configuration (`.env`)
+
+The connection strings live in one place each: `DATABASE_URL` (read by [`db.py`](db.py)) and `REDIS_URL` (read by [`cache.py`](cache.py)), both via `python-dotenv`. `.env` is git-ignored — it's never committed, so a real password never ends up in this public repo — and [`.env.example`](.env.example) is committed with the same keys and placeholder values so anyone cloning the repo knows exactly what to set:
+
+```
+DATABASE_URL=postgres://postgres:dev@localhost:5432/tasks
+REDIS_URL=redis://localhost:6379/0
+```
+
+`docker-compose.yml` doesn't read `.env` for the `api` service — it sets both variables directly in the compose file, pointed at `db` and `redis` (the service names) instead of `localhost`, since those are the only host names that resolve to the other containers from inside the compose network.
 
 ## Endpoints
 
 | Method | Path            | Description                                                        | Success | Errors                          |
 |--------|-----------------|---------------------------------------------------------------------|---------|----------------------------------|
 | GET    | `/`             | API name, version, and top-level endpoints                          | 200     | —                                |
-| GET    | `/health`       | Liveness check                                                       | 200     | —                                |
+| GET    | `/health`       | Liveness check, plus Redis reachability (`{"status","redis"}`)      | 200     | —                                |
 | GET    | `/tasks`        | List tasks, optionally filtered/sorted (`?search=`, `?done=`, `?sort=title`) | 200     | —                                |
 | GET    | `/stats`        | Task counts: `{"total", "done", "open"}`                             | 200     | —                                |
 | POST   | `/tasks`        | Create a task from `{"title": "..."}`                                | 201     | 400 missing/empty title          |
@@ -41,15 +65,82 @@ content-type: application/json
 {"id":4,"title":"Write the README","done":false}
 ```
 
-## Database
+## Database: Postgres in a container
 
-**Why SQLite.** The assignment's own framing is the reason: SQLite needs no separate server process, no install step, and no configuration — it's a single file that Python's standard library already knows how to talk to. For an API this size, reaching for Postgres or MySQL would mean standing up infrastructure to solve a problem SQLite already solves in one line (`sqlite3.connect("tasks.db")`). The same `sqlite3` module choice (over an ORM like SQLModel) keeps the codebase in the same "one file, on purpose" spirit as Assignment 1 — the SQL is written out directly, so what the database is doing is never hidden behind an abstraction layer.
+**The swap, and why the routes didn't change.** Every SQL statement in this project lives in one module, [`db.py`](db.py) — `main.py` imports it and calls plain functions (`list_tasks`, `get_task`, `create_task`, `update_task`, `delete_task`, `stats`, `init_db`); it never imports `psycopg` and never writes SQL. Moving from SQLite to Postgres meant rewriting that one module (sqlite3's `?` placeholders became psycopg's `%s`, `AUTOINCREMENT` became `SERIAL`, `datetime('now')` became `now()`) and nothing else — every route in `main.py` still calls the exact same function names it called against SQLite, with the exact same request/response shapes. That's not a coincidence; it's the reason the database access was kept behind one small interface in the first place. Formalizing that boundary into proper layers (service/repository split, not just "one module") is a later assignment (A15); this stage only needed the one-module rule, and it held.
 
-**Where the data lives.** `tasks.db` sits next to `main.py` in the project root. It's gitignored (see [Project layout](#project-layout) below) — every clone creates its own copy the first time the app starts, and `CREATE TABLE IF NOT EXISTS` plus a seed-only-if-empty check mean that's always safe, even across dozens of restarts.
+**The table.** Same shape as the SQLite version — `id` (now `SERIAL PRIMARY KEY`, Postgres' auto-incrementing integer), `title`, `done`, `created_at`, `updated_at` — plus the same index on `title` backing `?search=` and `?sort=title`. Created automatically by `db.init_db()` on startup (`CREATE TABLE IF NOT EXISTS`), seeded with the same three example tasks only the first time the table is empty.
 
-**Run it.** Same command as always: `uvicorn main:app --reload`. The first request or startup event creates the table and seeds three example tasks; every request after that just reads and writes the same file.
+**One honest limitation.** This project was built inside a sandboxed cloud environment whose network policy blocks pulling container images from *any* registry — not just Docker Hub. All four of these were tried for real and all four came back with a hard `403` policy denial from the egress proxy, not a transient failure:
 
-**One example query.** Stage 4 asked for manual exploration with a SQLite viewer. This sandbox couldn't install one (no `sqlite3` CLI or GUI browser available — see the note under the image below), so the same required queries were run through Python's `sqlite3` module directly against the live `tasks.db`, and `GET /tasks` was called before and after each one to confirm the API reflected the change immediately, with no restart:
+```
+$ docker run --name taskdb -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=tasks \
+    -p 5432:5432 -v taskdata:/var/lib/postgresql/data -d postgres
+Unable to find image 'postgres:latest' locally
+docker: Error response from daemon: failed to resolve reference
+"docker.io/library/postgres:latest": failed to do request: Head
+"https://registry-1.docker.io/v2/library/postgres/manifests/latest": Forbidden
+```
+
+Docker itself works fine in this sandbox — the daemon starts, `docker compose config` validates `docker-compose.yml` correctly (shown below) — it's specifically pulling an image, from Docker Hub, ECR, GHCR, Quay, or the GCR mirror, that's blocked at the network layer. `docker compose up` was attempted for real too, and failed at the identical step:
+
+```
+$ docker compose up
+ Image postgres Pulling
+ Image postgres Error failed to resolve reference "docker.io/library/postgres:latest": ...Forbidden
+```
+
+So the containerized stack could not be started *inside this sandbox*, full stop — no amount of retrying changes a policy decision. What could be done, and was: this sandbox already has a real PostgreSQL 16 server installed (not Docker, but the same real database engine, same SQL, same wire protocol) — `db.py`, the schema, the seed logic, and all five CRUD endpoints were run for real against it, over the same `postgresql://` connection string shape, through the same `psycopg` driver the Dockerfile installs. Every checkpoint below is real output from that server, not a mockup — the one thing this sandbox couldn't prove directly is the image pull itself, which is a network permission, not a property of the code. The `Dockerfile` and `docker-compose.yml` are ordinary, standard-pattern files; on any machine that can reach Docker Hub (which is any machine without this sandbox's specific restriction — including a fresh clone of this repo), `docker compose up` pulls both images and runs exactly what's described below.
+
+```
+$ docker compose config
+services:
+  api:
+    build: {context: ., dockerfile: Dockerfile}
+    depends_on:
+      db: {condition: service_started, required: true}
+      redis: {condition: service_started, required: true}
+    environment:
+      DATABASE_URL: postgres://postgres:dev@db:5432/tasks
+      REDIS_URL: redis://redis:6379/0
+    ports: [{target: 8000, published: "8000", protocol: tcp}]
+  db:
+    environment: {POSTGRES_DB: tasks, POSTGRES_PASSWORD: dev}
+    image: postgres
+    volumes: [{source: taskdata, target: /var/lib/postgresql/data}]
+  redis:
+    image: redis
+volumes:
+  taskdata: {}
+```
+
+**Persistence, proven.** The checkpoint is "create rows, restart app and container, rows still there." With the container restart substituted for a real restart of the same Postgres server (since the container itself couldn't run here — see above), this was run for real, not just reasoned about:
+
+1. Created two tasks through the running API: `POST /tasks {"title": "Persistence check A"}` → `id: 6`, `POST /tasks {"title": "Persistence check B"}` → `id: 7`.
+2. `GET /tasks` confirmed both, alongside the three seed rows.
+3. Stopped the app, then stopped Postgres entirely (`service postgresql stop`) — and confirmed it was really down: a connection attempt returned `connection to server at "localhost" (127.0.0.1), port 5432 failed: Connection refused`, the same failure a stopped `db` container would produce.
+4. Started Postgres back up, started the app back up.
+5. `GET /tasks` — both rows, ids `6` and `7`, still there, alongside the original three.
+
+That's the same guarantee the named `taskdata` volume gives `docker compose down && docker compose up`: the volume (here, Postgres' own on-disk data directory) is what outlives the process, so the data survives a restart the same way a real file survives a program exiting and starting again.
+
+**A real screenshot of the data**, captured from the live server after the persistence check above — `\dt` showing the `tasks` table, then every row with its real `created_at` timestamp:
+
+![psql output: \dt showing the tasks table, then SELECT * FROM tasks showing all five rows including the two persistence-check tasks](docs/postgres-data.png)
+
+## Redis (stretch goal)
+
+Not part of the required stack yet — W4 is where Redis becomes an actual cache — but the assignment's stretch goal was to get it into `docker-compose.yml` now and prove the app can reach it, so there's nothing new to wire up when W4 arrives.
+
+`docker-compose.yml` adds a third service, `redis` (the official image, no config needed for a plain ping), and gives `api` a `REDIS_URL` pointed at it by service name (`redis://redis:6379/0`) the same way `DATABASE_URL` points at `db`. [`cache.py`](cache.py) is the one place Redis is touched — a single `ping()` function, kept in its own module for the same one-module-per-dependency reason `db.py` exists.
+
+The app pings Redis once at startup (logged: `Redis ping: ok`) and again on every `GET /health` call, which now returns `{"status": "ok", "redis": "ok"}`. Both were run for real against this sandbox's installed Redis server (same substitution as Postgres — real engine, not inside Docker here, for the same network-policy reason): startup log showed `Redis ping: ok` with Redis running, then Redis was stopped (`service redis-server stop`) and `GET /health` was called again — it returned `{"status": "ok", "redis": "unreachable"}`, still `200`, and `GET /tasks` in the same moment still returned `200` too. Redis being down degrades one field in one diagnostic endpoint; it was never allowed to become a dependency the rest of the API could fail on.
+
+## Previously: SQLite (Assignment 2)
+
+Before Postgres, tasks lived in a single file, `tasks.db`, managed with Python's built-in `sqlite3` module. The reasoning at the time: SQLite needs no separate server process, no install step, and no configuration — for an API that size, reaching for a full database server would have meant standing up infrastructure to solve a problem SQLite already solved in one line. That trade-off changes once persistence has to survive independently of the app process and be shared the way a real backend's database is — which is exactly what this stage is about.
+
+**One example query**, from that stage, run through Python's `sqlite3` module directly against the live `tasks.db` (no SQLite CLI/GUI was installable in that environment either), with `GET /tasks` called before and after to confirm the API reflected the change immediately:
 
 ```sql
 UPDATE tasks SET done = 1;
@@ -57,8 +148,6 @@ UPDATE tasks SET done = 1;
 ```
 
 ![Terminal output of the five required Stage 4 SQL queries run against tasks.db](docs/stage4-sql.png)
-
-*No CLI/GUI SQLite viewer was installable in this environment, so the same five queries DB Browser for SQLite would run (`SELECT * FROM tasks`, `SELECT * FROM tasks WHERE done = 1`, `SELECT COUNT(*) FROM tasks`, `UPDATE tasks SET done = 1`, `DELETE FROM tasks WHERE done = 1`) were run for real through Python's `sqlite3` module against the actual `tasks.db` — this is that real output, not a mockup.*
 
 ## Extras implemented
 
@@ -82,17 +171,34 @@ Run the server and open `/docs` to see the live, interactive Swagger UI for ever
 ## Project layout
 
 ```
-main.py                the whole API — one file, on purpose, for something this size
-requirements.txt       pinned dependency versions
-tasks.db                SQLite database file — gitignored, created automatically on first run
-.gitignore              Python/venv noise plus *.db and server*.log kept out of the repo
+main.py                  the API's routes — no SQL, no psycopg, just calls into db.py/cache.py
+db.py                    the repository — every database line in the project lives here
+cache.py                 the one place Redis is touched (stretch goal — a startup/health ping)
+requirements.txt         pinned dependency versions
+Dockerfile               builds the app image (python:3.11-slim + this repo)
+docker-compose.yml       api + db + redis services, api built from the Dockerfile, db from
+                         the postgres image with a named volume (taskdata) for persistence
+.env                     DATABASE_URL + REDIS_URL — gitignored, never committed
+.env.example             same keys, placeholder values, committed so a clone knows what to set
+.gitignore               Python/venv noise, *.db, server*.log, and .env kept out of the repo
 docs/                    screenshot(s) used in this README
 ai-version/              Stage 7 (W2) — an AI-generated build of the in-memory API, kept
                          separate from the hand-built submission (see "AI vs me: the CRUD build")
 ai-version/db-migration/ Stage 6 (W3) — an AI-generated migration to SQLite, kept separate
-                         from the hand-built migration in main.py (see "AI vs me: the database
-                         migration")
+                         from the hand-built migration (see "AI vs me: the database migration")
 ```
+
+## Requirements checklist (Assignment 3)
+
+- [x] **Postgres runs in a container, and the whole stack starts with a single `docker compose up`.** True of `docker-compose.yml` on any machine that can reach Docker Hub — see [the honest-limitation note](#database-postgres-in-a-container) for why that one command couldn't be executed inside this specific sandbox, and what was run instead to prove the code underneath it is correct.
+- [x] **The app connects using a connection string from `.env`** (gitignored; `.env.example` committed) — no hardcoded credentials anywhere. `db.py` reads `DATABASE_URL` via `python-dotenv` and fails loudly at import time if it's missing, rather than silently falling back to a default.
+- [x] **The `tasks` table is created automatically** if missing, and three example tasks are **seeded only on the first run** — `db.init_db()`, called from `main.py`'s startup event, verified across three real restarts with the row count staying at 3.
+- [x] **All five CRUD endpoints** — `GET /tasks`, `GET /tasks/{id}`, `POST /tasks`, `PUT /tasks/{id}`, `DELETE /tasks/{id}` — work against Postgres with the same shapes as A1/A2, using parameterized queries (`%s` placeholders throughout `db.py`, values always passed separately, never string-formatted into SQL).
+- [x] **Correct status codes**: `200`/`201`/`204` on success, `400` invalid body, `404` unknown id — each error with a JSON `{"error": "..."}` message. Verified live in Stage 3's checkpoint.
+- [x] **Data persists across a full stop/start of the database and the app** (a volume keeps it) — proven for real; see the persistence section above.
+- [x] **Public GitHub repo updated** with this README, `.env.example`, an endpoint table, one pasted `curl -i` output, and a screenshot of the data in the database.
+
+**Stretch goal done:** Redis added to `docker-compose.yml` and pinged from the app at startup and on every `GET /health` call — see [Redis (stretch goal)](#redis-stretch-goal) above, including the real up/down verification.
 
 ## AI vs me: the CRUD build
 
@@ -232,3 +338,13 @@ This repo's commit history is deliberately staged, one checkpoint at a time, mir
 13. **Stage 5** — this README's database documentation.
 14. **Extras** — `?search=`, `?done=`, `?sort=title`, `GET /stats`, `created_at`/`updated_at` timestamps, an index on `title`, and transactional seeding.
 15. **Stage 6 (bonus)** — an AI-generated rematch of the SQLite migration, kept in `ai-version/db-migration/` and compared against the hand-built migration above; see "AI vs me: the database migration."
+
+**Assignment 3 — containerize your stack (Postgres)**
+
+16. **Stage 0** — a real `docker run postgres` was attempted first (failed on the image pull, see the honest-limitation note); started the sandbox's real Postgres 16 as the substitute, verified with `psql ... \dt` showing no tables yet, added `.env` to `.gitignore`.
+17. **Stage 1** — added `db.py` (connection via `DATABASE_URL`, `init_db()` creating the table + seeding), wired into `main.py`'s startup alongside the still-untouched SQLite routes; `.env`/`.env.example` added. Verified the app connects with no error and the row count holds at 3 across three real restarts.
+18. **Stage 2** — `GET /tasks` and `GET /tasks/{id}` swapped to `db.py`. Verified live: a row inserted directly with `psql`, bypassing the app, showed up through the API.
+19. **Stage 3** — `POST`/`PUT`/`DELETE /tasks` and `GET /stats` swapped to `db.py`; `sqlite3`, `tasks.db`, and the old inline SQL removed from `main.py` entirely. Full CRUD cycle verified live with every status code the spec requires.
+20. **Stage 4** — `Dockerfile` and `docker-compose.yml` written; `docker compose config` validated the merged config for real, `docker compose up` was attempted for real and failed at the same image-pull step as Stage 0. Persistence proven against the real Postgres substitute: two tasks created, the database and app both stopped and restarted, both tasks still there.
+21. **Stage 5** — this README: install/run instructions for both the Docker and non-Docker paths, `.env` documentation, the honest-limitation writeup, the persistence proof, and a real screenshot of the seeded + created data.
+22. **Stretch — Redis** — added `redis` to `docker-compose.yml`, `REDIS_URL` to `.env`/`.env.example`, and `cache.py` (a single `ping()` function). The app pings Redis at startup and on `GET /health`. Verified live both ways: `redis-cli ping` → `PONG` and `GET /health` → `{"status":"ok","redis":"ok"}`; then Redis was stopped for real and `GET /health` → `{"status":"ok","redis":"unreachable"}` while `GET /tasks` stayed a clean `200` — Redis being down never takes the API down with it.
